@@ -55,6 +55,18 @@ func initDB(dsn string) (*sql.DB, error) {
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		released_at DATETIME
 	);
+
+	CREATE TABLE IF NOT EXISTS proxy_rules (
+		id          INTEGER PRIMARY KEY AUTOINCREMENT,
+		name        TEXT    NOT NULL UNIQUE,
+		listen_port INTEGER NOT NULL,
+		target_host TEXT    NOT NULL,
+		target_port INTEGER NOT NULL,
+		protocol    TEXT    NOT NULL DEFAULT 'tcp',
+		enabled     INTEGER NOT NULL DEFAULT 1,
+		created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
 	`
 
 	if _, err := db.Exec(schema); err != nil {
@@ -70,15 +82,18 @@ func main() {
 	}
 	defer db.Close()
 
-	svc := service.NewInventoryService(db)
-	h := handler.NewInventoryHandler(svc)
+	invSvc := service.NewInventoryService(db)
+	invH := handler.NewInventoryHandler(invSvc)
+
+	proxySvc := service.NewProxyService(db)
+	proxyH := handler.NewProxyHandler(proxySvc)
 
 	go func() {
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
 		log.Println("expired order release job started, interval=1min")
 		for range ticker.C {
-			result, err := svc.ReleaseExpiredOrders()
+			result, err := invSvc.ReleaseExpiredOrders()
 			if err != nil {
 				log.Printf("release expired orders failed: %v", err)
 				continue
@@ -93,12 +108,26 @@ func main() {
 
 	api := r.Group("/api/v1")
 	{
-		api.POST("/skus", h.CreateSKU)
-		api.GET("/skus/:sku_code", h.GetSKU)
-		api.POST("/orders", h.CreateOrder)
-		api.POST("/orders/complete", h.CompleteOrder)
-		api.POST("/orders/cancel", h.CancelOrder)
-		api.POST("/orders/release-expired", h.ReleaseExpiredOrders)
+		api.POST("/skus", invH.CreateSKU)
+		api.GET("/skus/:sku_code", invH.GetSKU)
+		api.POST("/orders", invH.CreateOrder)
+		api.POST("/orders/complete", invH.CompleteOrder)
+		api.POST("/orders/cancel", invH.CancelOrder)
+		api.POST("/orders/release-expired", invH.ReleaseExpiredOrders)
+
+		proxy := api.Group("/proxy")
+		{
+			proxy.POST("", proxyH.CreateRule)
+			proxy.GET("", proxyH.ListRules)
+			proxy.GET("/:id", proxyH.GetRule)
+			proxy.GET("/port/:port", proxyH.GetRuleByPort)
+			proxy.PUT("/:id", proxyH.UpdateRule)
+			proxy.DELETE("/:id", proxyH.DeleteRule)
+			proxy.POST("/:id/enable", proxyH.EnableRule)
+			proxy.POST("/:id/disable", proxyH.DisableRule)
+			proxy.POST("/port/enable", proxyH.EnableRuleByPort)
+			proxy.POST("/port/disable", proxyH.DisableRuleByPort)
+		}
 	}
 
 	log.Println("server starting on :8080")

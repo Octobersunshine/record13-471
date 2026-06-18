@@ -39,6 +39,18 @@ type InventoryLock struct {
 	ReleasedAt *time.Time
 }
 
+type ProxyRule struct {
+	ID         int64
+	Name       string
+	ListenPort int
+	TargetHost string
+	TargetPort int
+	Protocol   string
+	Enabled    bool
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+}
+
 const (
 	OrderStatusCreated   = "created"
 	OrderStatusCompleted = "completed"
@@ -49,4 +61,7 @@ const (
 	LockStatusReleased = "released"
 
 	DefaultOrderTTLMinutes = 30
+
+	ProxyProtocolTCP = "tcp"
+	ProxyProtocolUDP = "udp"
 )
