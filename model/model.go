@@ -17,6 +17,7 @@ type Order struct {
 	ID        int64
 	OrderNo   string
 	Status    string
+	ExpireAt  time.Time
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
@@ -42,7 +43,10 @@ const (
 	OrderStatusCreated   = "created"
 	OrderStatusCompleted = "completed"
 	OrderStatusCancelled = "cancelled"
+	OrderStatusExpired   = "expired"
 
 	LockStatusLocked   = "locked"
 	LockStatusReleased = "released"
+
+	DefaultOrderTTLMinutes = 30
 )

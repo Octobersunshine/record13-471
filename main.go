@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"log"
+	"time"
 
 	"inventory/handler"
 	"inventory/service"
@@ -33,6 +34,7 @@ func initDB(dsn string) (*sql.DB, error) {
 		id         INTEGER PRIMARY KEY AUTOINCREMENT,
 		order_no   TEXT    NOT NULL UNIQUE,
 		status     TEXT    NOT NULL DEFAULT 'created',
+		expire_at  DATETIME NOT NULL,
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);
@@ -71,6 +73,22 @@ func main() {
 	svc := service.NewInventoryService(db)
 	h := handler.NewInventoryHandler(svc)
 
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		log.Println("expired order release job started, interval=1min")
+		for range ticker.C {
+			result, err := svc.ReleaseExpiredOrders()
+			if err != nil {
+				log.Printf("release expired orders failed: %v", err)
+				continue
+			}
+			if result.ReleasedOrderCount > 0 {
+				log.Printf("released expired orders: orders=%d, locks=%d", result.ReleasedOrderCount, result.ReleasedLockCount)
+			}
+		}
+	}()
+
 	r := gin.Default()
 
 	api := r.Group("/api/v1")
@@ -80,6 +98,7 @@ func main() {
 		api.POST("/orders", h.CreateOrder)
 		api.POST("/orders/complete", h.CompleteOrder)
 		api.POST("/orders/cancel", h.CancelOrder)
+		api.POST("/orders/release-expired", h.ReleaseExpiredOrders)
 	}
 
 	log.Println("server starting on :8080")

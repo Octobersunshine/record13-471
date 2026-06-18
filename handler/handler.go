@@ -105,3 +105,12 @@ func (h *InventoryHandler) CancelOrder(c *gin.Context) {
 	}
 	ok(c, order)
 }
+
+func (h *InventoryHandler) ReleaseExpiredOrders(c *gin.Context) {
+	result, err := h.svc.ReleaseExpiredOrders()
+	if err != nil {
+		fail(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ok(c, result)
+}

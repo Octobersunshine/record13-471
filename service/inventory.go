@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
 	"inventory/model"
 )
@@ -34,10 +35,11 @@ func (s *InventoryService) CreateOrder(req OrderRequest) (*model.Order, error) {
 	defer tx.Rollback()
 
 	var order model.Order
+	expireAt := time.Now().Add(time.Duration(model.DefaultOrderTTLMinutes) * time.Minute)
 	err = tx.QueryRow(
-		"INSERT INTO orders (order_no, status) VALUES (?, ?) RETURNING id, order_no, status, created_at, updated_at",
-		req.OrderNo, model.OrderStatusCreated,
-	).Scan(&order.ID, &order.OrderNo, &order.Status, &order.CreatedAt, &order.UpdatedAt)
+		"INSERT INTO orders (order_no, status, expire_at) VALUES (?, ?, ?) RETURNING id, order_no, status, expire_at, created_at, updated_at",
+		req.OrderNo, model.OrderStatusCreated, expireAt,
+	).Scan(&order.ID, &order.OrderNo, &order.Status, &order.ExpireAt, &order.CreatedAt, &order.UpdatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("insert order: %w", err)
 	}
@@ -100,9 +102,9 @@ func (s *InventoryService) CompleteOrder(orderNo string) (*model.Order, error) {
 
 	var order model.Order
 	err = tx.QueryRow(
-		"SELECT id, order_no, status, created_at, updated_at FROM orders WHERE order_no = ?",
+		"SELECT id, order_no, status, expire_at, created_at, updated_at FROM orders WHERE order_no = ?",
 		orderNo,
-	).Scan(&order.ID, &order.OrderNo, &order.Status, &order.CreatedAt, &order.UpdatedAt)
+	).Scan(&order.ID, &order.OrderNo, &order.Status, &order.ExpireAt, &order.CreatedAt, &order.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("order not found: %s", orderNo)
@@ -112,6 +114,10 @@ func (s *InventoryService) CompleteOrder(orderNo string) (*model.Order, error) {
 
 	if order.Status != model.OrderStatusCreated {
 		return nil, fmt.Errorf("order %s cannot be completed: current status=%s", orderNo, order.Status)
+	}
+
+	if time.Now().After(order.ExpireAt) {
+		return nil, fmt.Errorf("order %s has expired and cannot be completed", orderNo)
 	}
 
 	rows, err := tx.Query(
@@ -180,9 +186,9 @@ func (s *InventoryService) CancelOrder(orderNo string) (*model.Order, error) {
 
 	var order model.Order
 	err = tx.QueryRow(
-		"SELECT id, order_no, status, created_at, updated_at FROM orders WHERE order_no = ?",
+		"SELECT id, order_no, status, expire_at, created_at, updated_at FROM orders WHERE order_no = ?",
 		orderNo,
-	).Scan(&order.ID, &order.OrderNo, &order.Status, &order.CreatedAt, &order.UpdatedAt)
+	).Scan(&order.ID, &order.OrderNo, &order.Status, &order.ExpireAt, &order.CreatedAt, &order.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("order not found: %s", orderNo)
@@ -276,4 +282,96 @@ func (s *InventoryService) CreateSKU(skuCode, name string, totalQty int) (*model
 		return nil, fmt.Errorf("insert sku: %w", err)
 	}
 	return &sku, nil
+}
+
+type ReleaseResult struct {
+	ReleasedOrderCount int64
+	ReleasedLockCount  int64
+}
+
+func (s *InventoryService) ReleaseExpiredOrders() (*ReleaseResult, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(
+		"SELECT id, order_no, status, expire_at, created_at, updated_at FROM orders WHERE status = ? AND expire_at <= ?",
+		model.OrderStatusCreated, time.Now(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query expired orders: %w", err)
+	}
+	defer rows.Close()
+
+	var result ReleaseResult
+	for rows.Next() {
+		var order model.Order
+		if err := rows.Scan(&order.ID, &order.OrderNo, &order.Status, &order.ExpireAt, &order.CreatedAt, &order.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan order: %w", err)
+		}
+
+		lockRows, err := tx.Query(
+			"SELECT il.id, il.sku_id, il.qty FROM inventory_locks il WHERE il.order_id = ? AND il.status = ?",
+			order.ID, model.LockStatusLocked,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("query locks for order %d: %w", order.ID, err)
+		}
+
+		type lockInfo struct {
+			ID    int64
+			SkuID int64
+			Qty   int
+		}
+		var locks []lockInfo
+		for lockRows.Next() {
+			var l lockInfo
+			if err := lockRows.Scan(&l.ID, &l.SkuID, &l.Qty); err != nil {
+				lockRows.Close()
+				return nil, fmt.Errorf("scan lock: %w", err)
+			}
+			locks = append(locks, l)
+		}
+		lockRows.Close()
+
+		for _, l := range locks {
+			_, err = tx.Exec(
+				"UPDATE skus SET locked_qty = locked_qty - ?, available_qty = available_qty + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+				l.Qty, l.Qty, l.SkuID,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("restore stock for sku_id=%d: %w", l.SkuID, err)
+			}
+
+			_, err = tx.Exec(
+				"UPDATE inventory_locks SET status = ?, released_at = CURRENT_TIMESTAMP WHERE id = ?",
+				model.LockStatusReleased, l.ID,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("update lock status: %w", err)
+			}
+			result.ReleasedLockCount++
+		}
+
+		_, err = tx.Exec(
+			"UPDATE orders SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+			model.OrderStatusExpired, order.ID,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("update order status to expired: %w", err)
+		}
+		result.ReleasedOrderCount++
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows err: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
+	}
+
+	return &result, nil
 }
